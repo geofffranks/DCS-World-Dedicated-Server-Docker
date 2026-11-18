@@ -1,0 +1,10 @@
+  location REPLACE_FILES_PREFIXfiles {
+    fancyindex on;
+    fancyindex_footer REPLACE_FILES_PREFIXnginx/footer.html;
+    fancyindex_header REPLACE_FILES_PREFIXnginx/header.html;
+    alias REPLACE_FILES_PATH;
+    if (-f $request_filename) {
+        add_header Content-Disposition "attachment";
+        add_header X-Content-Type-Options "nosniff";
+    }
+  }

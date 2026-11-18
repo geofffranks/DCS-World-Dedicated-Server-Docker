@@ -50,6 +50,8 @@ jobs:
         with:
           context: ./docker
           file: ./docker/Dockerfile
+          pull: true
+          no-cache: true
           push: true
           tags: |
             aterfax/dcs-world-dedicated-server:latest 

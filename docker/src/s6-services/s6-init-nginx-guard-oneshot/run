@@ -1,0 +1,156 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+# Runs after init-nginx has rewritten the effective nginx site configuration
+# for this boot, and before svc-nginx is allowed to start (the Dockerfile adds
+# init-nginx-guard to svc-nginx's dependencies). Any failure here keeps nginx
+# from starting, so a missing module, a config error, or re-enabled HTTP/2
+# fails closed instead of serving the desktop in an unexpected state.
+#
+# with-contenv is required: this script reads SUBFOLDER, FILE_MANAGER_PATH,
+# SELKIES_FILE_TRANSFERS and HARDEN_DESKTOP from the container environment.
+
+set -euo pipefail
+
+NGINX_MAIN_CONF=/etc/nginx/nginx.conf
+NGINX_SITE_CONF=/etc/nginx/sites-available/default
+FANCYINDEX_MODULE=/usr/lib/nginx/modules/ngx_http_fancyindex_module.so
+FANCYINDEX_LOAD_CONF=/etc/nginx/modules-enabled/50-mod-http-fancyindex.conf
+FILES_BLOCK_TEMPLATE=/etc/nginx/files-location-block.template
+THEME_SRC_DIR=/usr/share/selkies/nginx-theme
+THEME_WEB_DIR=/usr/share/selkies/web/nginx
+FILES_MANAGER_PATH="${FILE_MANAGER_PATH:-/config/Desktop}"
+
+# Normalize SUBFOLDER to exactly one leading and one trailing slash (the
+# upstream template expects this form: location SUBFOLDERfiles becomes
+# location /files with the default and location /desktop/files for
+# SUBFOLDER=/desktop or /desktop/).
+SUBFOLDER="${SUBFOLDER:-/}"
+SUBFOLDER="${SUBFOLDER#/}"
+SUBFOLDER="${SUBFOLDER#/}"
+SUBFOLDER="${SUBFOLDER%/}"
+SUBFOLDER="${SUBFOLDER%/}"
+if [ -z "${SUBFOLDER}" ]; then SUBFOLDER="/"; else SUBFOLDER="/${SUBFOLDER}/"; fi
+FILES_PREFIX="${SUBFOLDER}"
+FILES_LOCATION="${FILES_PREFIX}files"
+
+# The image-owned main config must keep HTTP/2 explicitly disabled.
+if ! grep -Eq '^[[:space:]]*http2[[:space:]]+off[[:space:]]*;' "${NGINX_MAIN_CONF}"; then
+    echo "HTTP/2 explicit-off directive missing from ${NGINX_MAIN_CONF}" >&2
+    exit 1
+fi
+
+# init-nginx rewrites the site config from the image template on every start.
+# Strip any per-listen HTTP/2 flag tokens (whatever their position or
+# neighbours) and any per-server switch so the explicit "off" in the main
+# config stays authoritative.
+sed -i -E \
+    -e '/^[[:space:]]*listen[[:space:]]/s/\bhttp2\b[[:space:]]*//' \
+    -e '/^[[:space:]]*http2[[:space:]]+on[[:space:]]*;[[:space:]]*$/d' \
+    "${NGINX_SITE_CONF}"
+
+# The fancyindex module artifacts must exist before nginx starts.
+if [[ ! -s "${FANCYINDEX_MODULE}" ]] || [[ ! -s "${FANCYINDEX_LOAD_CONF}" ]]; then
+    echo "fancyindex module artifacts missing: ${FANCYINDEX_MODULE} ${FANCYINDEX_LOAD_CONF}" >&2
+    exit 1
+fi
+
+# The current webtop template no longer ships the desktop file-manager route;
+# restore the previous release's /files behaviour (themed fancyindex listing,
+# direct downloads with attachment headers) after the boot-time regeneration.
+# init-nginx empties /usr/share/selkies/web and re-copies the dashboard into
+# it on every start, so the theme is staged outside that tree and installed
+# into the web root here, after the regeneration. The theme source files are
+# vendored upstream bytes; see PROVENANCE.md in the build context.
+if [[ ! -s "${THEME_SRC_DIR}/header.html" ]] || [[ ! -s "${THEME_SRC_DIR}/footer.html" ]]; then
+    echo "fancyindex theme files missing from ${THEME_SRC_DIR}" >&2
+    exit 1
+fi
+install -d -m 755 "${THEME_WEB_DIR}"
+install -m 644 "${THEME_SRC_DIR}/header.html" "${THEME_WEB_DIR}/header.html"
+sed \
+    -e "s|REPLACE_DOWNLOADS_PATH|${FILES_MANAGER_PATH%/}|g" \
+    -e "s|webPathPrefix = '/files/'|webPathPrefix = '${FILES_PREFIX}files/'|" \
+    "${THEME_SRC_DIR}/footer.html" > "${THEME_WEB_DIR}/footer.html"
+chmod 644 "${THEME_WEB_DIR}/footer.html"
+if ! grep -qF "webPathPrefix = '${FILES_PREFIX}files/'" "${THEME_WEB_DIR}/footer.html"; then
+    echo "footer theme path substitution failed" >&2
+    exit 1
+fi
+
+transfers="${SELKIES_FILE_TRANSFERS:-upload,download}"
+hardened="${HARDEN_DESKTOP:-false}"
+FILES_ENABLED=0
+if [[ "${transfers,,}" == *download* ]] && [[ "${hardened,,}" != "true" ]]; then
+    FILES_ENABLED=1
+    if ! grep -qF "location ${FILES_LOCATION} {" "${NGINX_SITE_CONF}"; then
+        if [[ ! -s "${FILES_BLOCK_TEMPLATE}" ]]; then
+            echo "files location block template missing: ${FILES_BLOCK_TEMPLATE}" >&2
+            exit 1
+        fi
+        FILES_BLOCK="$(sed \
+            -e "s|REPLACE_FILES_PREFIX|${FILES_PREFIX}|g" \
+            -e "s|REPLACE_FILES_PATH|${FILES_MANAGER_PATH%/}/|g" \
+            "${FILES_BLOCK_TEMPLATE}")"
+        AWK_OUT="$(mktemp)"
+        awk -v block="${FILES_BLOCK}" '
+        {
+            line = $0
+            opens = gsub(/{/, "&", line)
+            closes = gsub(/}/, "&", line)
+            if (inserver && depth == 1 && closes > 0) {
+                printf "%s\n", block
+            }
+            print line
+            depth += opens - closes
+            if (depth >= 1) inserver = 1
+            if (depth == 0) inserver = 0
+        }
+        ' "${NGINX_SITE_CONF}" > "${AWK_OUT}"
+        INJECTED="$(grep -cF "location ${FILES_LOCATION} {" "${AWK_OUT}")"
+        if [ "${INJECTED}" -lt 2 ]; then
+            echo "expected a ${FILES_LOCATION} block in both server blocks, found ${INJECTED}" >&2
+            rm -f "${AWK_OUT}"
+            exit 1
+        fi
+        install -m 644 "${AWK_OUT}" "${NGINX_SITE_CONF}"
+        rm -f "${AWK_OUT}"
+    fi
+else
+    # Downloads disabled or hardened desktop: no file-manager route.
+    sed -i "\\#${FILES_LOCATION} {#,/^  }/d" "${NGINX_SITE_CONF}"
+fi
+
+# Fail closed on the effective configuration: after regeneration and the
+# edits above, nginx itself must dump a config that keeps HTTP/2 disabled
+# everywhere and still parses cleanly.
+EFFECTIVE_CONFIG="$(/usr/sbin/nginx -T 2>/dev/null)"
+if [[ -z "${EFFECTIVE_CONFIG}" ]]; then
+    echo "nginx -T produced no effective configuration" >&2
+    exit 1
+fi
+if grep -Eq '^[[:space:]]*listen[[:space:]][^#;]*\bhttp2\b' <<<"${EFFECTIVE_CONFIG}"; then
+    echo "effective configuration enables http2 on a listen directive" >&2
+    exit 1
+fi
+if grep -Eq '^[[:space:]]*http2[[:space:]]+on[[:space:]]*;' <<<"${EFFECTIVE_CONFIG}"; then
+    echo "effective configuration contains an http2 on directive" >&2
+    exit 1
+fi
+if ! grep -Eq '^[[:space:]]*http2[[:space:]]+off[[:space:]]*;' <<<"${EFFECTIVE_CONFIG}"; then
+    echo "effective configuration lacks the explicit http2 off directive" >&2
+    exit 1
+fi
+if [ "${FILES_ENABLED}" -eq 1 ]; then
+    grep -qF "location ${FILES_LOCATION} {" <<<"${EFFECTIVE_CONFIG}" || {
+        echo "effective configuration lacks the ${FILES_LOCATION} location block" >&2
+        exit 1
+    }
+    fancyindex_enabled="$(grep -cF 'fancyindex on;' <<<"${EFFECTIVE_CONFIG}")"
+    if [ "${fancyindex_enabled}" -lt 2 ]; then
+        echo "effective configuration enables fancyindex in fewer than 2 locations" >&2
+        exit 1
+    fi
+fi
+
+/usr/sbin/nginx -t

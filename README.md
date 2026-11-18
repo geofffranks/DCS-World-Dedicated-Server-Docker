@@ -52,7 +52,8 @@ Various automations and helper scripts are provided. In depth configuration and 
 
 ### Using a self built image
 
-* Navigate to the ``docker`` subdirectory and run the command ``docker build -t $USER/dcs-world-dedicated-server .``
+* Navigate to the ``docker`` subdirectory and run ``docker build --pull --no-cache --platform linux/amd64 -t $USER/dcs-world-dedicated-server .``. Use both ``--pull`` and ``--no-cache`` for every patch-refresh build: they refresh the Webtop base and rerun package selection rather than reuse an older installation layer.
+* Fresh builds select the latest available nginx.org mainline Debian package and build a matching fancyindex module. This does not update existing containers automatically; recreate your service with the newly built image after checking it. Keep the previous image available for rollback.
 * Take a note of the final line of this command's output e.g. :
 
         => => naming to docker.io/myusername/dcs-world-dedicated-server
